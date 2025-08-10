@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+<title>Theater-Notenjagd — Mobile Jump'n'Run</title>
+<style>
+  html,body { height:100%; margin:0; background:#0b0b12; color:#fff; font-family: Arial, sans-serif; -webkit-user-select:none; }
+  #gameCanvas { display:block; margin:0 auto; background: linear-gradient(#0f1220, #1c2030); touch-action:none; }
+  .ui {
+    position:fixed; left:0; right:0; bottom:0; pointer-events:none;
+    display:flex; justify-content:space-between; padding:10px;
+  }
+  .controls { pointer-events:auto; display:flex; gap:10px; align-items:center; }
+  .btn {
+    width:72px; height:72px; border-radius:50%; background:rgba(255,255,255,0.08);
+    display:flex; align-items:center; justify-content:center; font-size:20px; color:#fff;
+    user-select:none;
+  }
+  .btn:active { transform:scale(0.98); background:rgba(255,255,255,0.12); }
+  .small { width:56px; height:56px; font-size:18px; }
+  #hud { position:fixed; top:10px; left:10px; pointer-events:none; font-weight:bold; }
+  #message { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,0.6); padding:12px 18px; border-radius:8px; display:none; }
+  /* Layout tweak to ensure canvas fills width but keeps aspect for mobile */
+  #wrap { display:flex; justify-content:center; align-items:center; height:100%; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gameCanvas" width="900" height="540"></canvas>
+</div>
+
+<div id="hud">Noten: <span id="score">0</span> / <span id="total">0</span></div>
+
+<div class="ui">
+  <div class="controls" style="margin-left:8px;">
+    <div id="leftBtn" class="btn">◀</div>
+    <div id="rightBtn" class="btn">▶</div>
+  </div>
+  <div class="controls" style="margin-right:8px;">
+    <div id="jumpBtn" class="btn small">↑</div>
+  </div>
+</div>
+
+<div id="message"></div>
+
+<script>
+/*
+  Mobile 2D Jump'n'Run
+  - Uses player.jpg as head sprite (place in same folder)
+  - Touch + keyboard controls
+  - Simple platform collision
+  - Collect 'notes' (music sheets)
+*/
+
+/* CONFIG */
+const ASSET_PLAYER = 'player.jpg'; // rename your uploaded photo to this and put it in same folder
+const GAME_WIDTH = 900;            // base logical resolution, scaled to screen
+const GAME_HEIGHT = 540;
+const GRAVITY = 2000;              // px / s^2
+const MOVE_SPEED = 320;            // px / s
+const JUMP_SPEED = 760;            // px / s
+const NOTE_COUNT = 6;
+
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+/* Scale canvas to fit width while preserving aspect ratio */
+function resizeCanvas() {
+  const ratio = GAME_WIDTH / GAME_HEIGHT;
+  let w = window.innerWidth;
+  let h = window.innerHeight;
+  // Keep some space for controls on short phones: allow canvas to fill ~70% height if needed
+  if (h < w / ratio) {
+    // portrait short
+    canvas.style.width = Math.min(w, GAME_WIDTH) + 'px';
+    canvas.style.height = (canvas.clientWidth / ratio) + 'px';
+  } else {
+    canvas.style.height = Math.min(h * 0.78, GAME_HEIGHT) + 'px';
+    canvas.style.width = (canvas.clientHeight * ratio) + 'px';
+  }
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+/* INPUT */
+let input = { left:false, right:false, jump:false };
+function setupControls() {
+  const leftBtn = document.getElementById('leftBtn');
+  const rightBtn = document.getElementById('rightBtn');
+  const jumpBtn = document.getElementById('jumpBtn');
+
+  // Touch
+  [[leftBtn,'left'],[rightBtn,'right'],[jumpBtn,'jump']].forEach(([elName,act])=>{
+    const el = document.getElementById(elName.id ? elName.id : (typeof elName === 'string' ? elName : elName));
+    const node = (el || elName);
+    node.addEventListener('touchstart', e => { e.preventDefault(); input[act]=true; });
+    node.addEventListener('touchend', e => { e.preventDefault(); input[act]=false; });
+    node.addEventListener('mousedown', e => { e.preventDefault(); input[act]=true; });
+    node.addEventListener('mouseup', e => { e.preventDefault(); input[act]=false; });
+    node.addEventListener('mouseleave', e => { input[act]=false; });
+  });
+
+  // Keyboard
+  window.addEventListener('keydown', e=>{
+    if (e.code === 'ArrowLeft' || e.key === 'a') input.left = true;
+    if (e.code === 'ArrowRight' || e.key === 'd') input.right = true;
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.key === 'w') input.jump = true;
+  });
+  window.addEventListener('keyup', e=>{
+    if (e.code === 'ArrowLeft' || e.key === 'a') input.left = false;
+    if (e.code === 'ArrowRight' || e.key === 'd') input.right = false;
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.key === 'w') input.jump = false;
+  });
+}
+setupControls();
+
+/* GAME WORLD (simple platforms and tokens placed to look like theater) */
+/* Coordinates are in the logical GAME_WIDTH x GAME_HEIGHT space */
+const platforms = [
+  // floor
+  {x:0, y:GAME_HEIGHT-60, w:GAME_WIDTH, h:60},
+  // stage platforms
+  {x:40, y:GAME_HEIGHT-160, w:240, h:20},
+  {x:320, y:GAME_HEIGHT-220, w:260, h:20},
+  {x:640, y:GAME_HEIGHT-300, w:220, h:20},
+  {x:520, y:GAME_HEIGHT-100, w:120, h:20},
+  {x:120, y:GAME_HEIGHT-320, w:160, h:20}
+];
+
+/* notes (collectables) */
+let notes = [];
+function spawnNotes() {
+  notes = [];
+  const positions = [
+    {x:140, y:GAME_HEIGHT-370},
+    {x:420, y:GAME_HEIGHT-260},
+    {x:720, y:GAME_HEIGHT-350},
+    {x:580, y:GAME_HEIGHT-160},
+    {x:240, y:GAME_HEIGHT-200},
+    {x:820, y:GAME_HEIGHT-120}
+  ];
+  // take first NOTE_COUNT positions
+  for (let i=0;i<Math.min(NOTE_COUNT, positions.length);i++){
+    notes.push({x:positions[i].x, y:positions[i].y, r:18, collected:false});
+  }
+}
+spawnNotes();
+document.getElementById('total').innerText = notes.length;
+
+/* PLAYER */
+const player = {
+  x:80, y: GAME_HEIGHT-200,
+  w:60, h:100,
+  vx:0, vy:0,
+  grounded:false,
+  facing:1 // 1 right, -1 left
+};
+
+/* Load player photo */
+const img = new Image();
+img.src = ASSET_PLAYER;
+let imgLoaded = false;
+img.onload = ()=> { imgLoaded = true; console.log('Player image loaded.'); };
+
+/* UTIL: AABB collision */
+function rectsOverlap(a,b){
+  return !(a.x+biasRight(a) > b.x+b.w || a.x + a.w < b.x || a.y + a.h < b.y || a.y > b.y + b.h);
+}
+function biasRight(a){ return 0; } // placeholder if needed for fine collision
+
+/* game loop */
+let lastTime = null;
+let score = 0;
+const scoreEl = document.getElementById('score');
+function gameStep(ts) {
+  if (!lastTime) lastTime = ts;
+  const dt = Math.min((ts - lastTime) / 1000, 0.05); // seconds
+  lastTime = ts;
+
+  update(dt);
+  render();
+
+  requestAnimationFrame(gameStep);
+}
+requestAnimationFrame(gameStep);
+
+/* Update physics and game logic */
+function update(dt) {
+  // horizontal movement
+  let move = 0;
+  if (input.left) move -= 1;
+  if (input.right) move += 1;
+  player.vx = move * MOVE_SPEED;
+  if (move !== 0) player.facing = move > 0 ? 1 : -1;
+
+  // apply gravity
+  player.vy += GRAVITY * dt;
+
+  // jump (only on initial press)
+  if (input.jump && player.grounded) {
+    player.vy = -JUMP_SPEED;
+    player.grounded = false;
+  }
+
+  // integrate
+  player.x += player.vx * dt;
+  player.y += player.vy * dt;
+
+  // collisions with world platforms (simple SAT with resolution)
+  player.grounded = false;
+  for (let p of platforms) {
+    // only check if overlapping in X
+    if (player.x + player.w > p.x && player.x < p.x + p.w) {
+      // falling onto platform?
+      if (player.y + player.h > p.y && player.y + player.h - player.vy*dt <= p.y) {
+        // snap to top
+        player.y = p.y - player.h;
+        player.vy = 0;
+        player.grounded = true;
+      }
+    }
+    // simple left/right bounds
+    if (player.y + player.h > p.y && player.y < p.y + p.h) {
+      if (player.x < p.x + p.w && player.x + player.w > p.x) {
+        // resolve horizontal penetration (basic)
+        if (player.x < p.x) {
+          // pushing into platform from left?
+          if (player.x + player.w > p.x && player.x < p.x) {
+            player.x = p.x - player.w;
+          }
+        } else {
+          if (player.x < p.x + p.w && player.x + player.w > p.x + p.w) {
+            player.x = p.x + p.w;
+          }
+        }
+      }
+    }
+  }
+
+  // keep inside world horizontally
+  if (player.x < 0) player.x = 0;
+  if (player.x + player.w > GAME_WIDTH) player.x = GAME_WIDTH - player.w;
+
+  // collect notes
+  for (let n of notes) {
+    if (!n.collected) {
+      const dx = (player.x + player.w/2) - n.x;
+      const dy = (player.y + player.h/2) - n.y;
+      const dist2 = dx*dx + dy*dy;
+      if (dist2 < (n.r + Math.max(player.w,player.h)/3)*(n.r + Math.max(player.w,player.h)/3)) {
+        n.collected = true;
+        score += 1;
+        scoreEl.innerText = score;
+        if (score === notes.length) {
+          showMessage('Alle Noten gesammelt! Bravo 🎉');
+        } else {
+          flashMessage('Note eingesammelt!');
+        }
+      }
+    }
+  }
+}
+
+/* simple message overlay */
+let msgTimer = null;
+function showMessage(text) {
+  const m = document.getElementById('message');
+  m.style.display = 'block';
+  m.innerText = text;
+  if (msgTimer) clearTimeout(msgTimer);
+  msgTimer = setTimeout(()=>{ m.style.display='none'; }, 3500);
+}
+function flashMessage(text) {
+  showMessage(text);
+}
+
+/* Rendering */
+function render() {
+  // clear
+  ctx.clearRect(0,0,GAME_WIDTH,GAME_HEIGHT);
+
+  // background - theater feel: curtains and spotlights
+  drawBackground();
+
+  // draw platforms (stage, steps)
+  for (let p of platforms) {
+    drawPlatform(p);
+  }
+
+  // draw notes
+  for (let n of notes) {
+    if (!n.collected) drawNote(n);
+  }
+
+  // draw player (use photo as head if available)
+  drawPlayer();
+
+  // small HUD element drawn on canvas (optional)
+  // scale canvas to css size automatically by browser; logical coordinates remain fixed.
+}
+
+/* Background painting */
+function drawBackground() {
+  // gradient floor-ish
+  const g = ctx.createLinearGradient(0,0,0,GAME_HEIGHT);
+  g.addColorStop(0, '#101222');
+  g.addColorStop(0.7, '#151824');
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,GAME_WIDTH,GAME_HEIGHT);
+
+  // curtains (sides)
+  ctx.fillStyle = '#2c001e';
+  ctx.fillRect(0,0,160,GAME_HEIGHT);
+  ctx.fillRect(GAME_WIDTH-160,0,160,GAME_HEIGHT);
+
+  // stage front shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillRect(0,GAME_HEIGHT-120,GAME_WIDTH,120);
+
+  // spotlight circles
+  const sx = player.x + player.w/2;
+  const sy = player.y;
+  const sp = ctx.createRadialGradient(sx, sy-120, 20, sx, sy-40, 260);
+  sp.addColorStop(0, 'rgba(255,255,220,0.22)');
+  sp.addColorStop(1, 'rgba(255,255,220,0)');
+  ctx.fillStyle = sp;
+  ctx.beginPath();
+  ctx.arc(sx, sy-20, 260, 0, Math.PI*2);
+  ctx.fill();
+}
+
+/* draw a platform */
+function drawPlatform(p) {
+  // platform base
+  ctx.fillStyle = '#6a5a3f';
+  ctx.fillRect(p.x, p.y, p.w, p.h);
+  // stage plank lines
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = 1;
+  const step = 22;
+  for (let i=0;i<p.w;i+=step) {
+    ctx.beginPath();
+    ctx.moveTo(p.x + i, p.y + 2);
+    ctx.lineTo(p.x + i + 6, p.y + p.h - 2);
+    ctx.stroke();
+  }
+}
+
+/* draw a spinny note token */
+function drawNote(n) {
+  const t = Date.now() * 0.006;
+  const wob = Math.sin(t*2 + n.x*0.01) * 6;
+  ctx.save();
+  ctx.translate(n.x, n.y + wob);
+  ctx.rotate(Math.sin(t*1.3)*0.25);
+  // body
+  ctx.fillStyle = '#fffbea';
+  ctx.beginPath();
+  ctx.rect(-14, -20, 28, 36);
+  ctx.fill();
+  // staff lines
+  ctx.strokeStyle = '#2a2a2a';
+  ctx.lineWidth = 1;
+  for (let i=-10;i<=10;i+=5) {
+    ctx.beginPath();
+    ctx.moveTo(-12, i);
+    ctx.lineTo(12, i);
+    ctx.stroke();
+  }
+  // a simple note
+  ctx.fillStyle = '#222';
+  ctx.beginPath();
+  ctx.ellipse(6, -6, 6, 8, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(10, -6);
+  ctx.lineTo(10, -28);
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.restore();
+}
+
+/* draw player: simple body + photo as head */
+function drawPlayer() {
+  // body
+  const x = player.x;
+  const y = player.y;
+  // shadow under feet
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(x + player.w/2, y + player.h - 6, player.w/2, 8, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // torso
+  ctx.fillStyle = '#222';
+  const torsoH = Math.floor(player.h * 0.55);
+  const torsoW = player.w;
+  ctx.fillRect(x, y + player.h - torsoH - 20, torsoW, torsoH);
+
+  // legs - simple
+  ctx.fillStyle = '#111';
+  ctx.fillRect(x + 6, y + player.h - 20, 18, 20);
+  ctx.fillRect(x + player.w - 24, y + player.h - 20, 18, 20);
+
+  // head: draw user's photo cropped as circle
+  const headSize = 62;
+  const hx = x + player.w/2 - headSize/2;
+  const hy = y - 8;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(hx + headSize/2, hy + headSize/2, headSize/2 + 1, 0, Math.PI*2);
+  ctx.closePath();
+  ctx.clip();
+
+  if (imgLoaded) {
+    // draw the image centered and scaled to fill the head circle
+    // we crop a centered square from the photo
+    const iw = img.width, ih = img.height;
+    const srcSize = Math.min(iw, ih);
+    const sx = (iw - srcSize) / 2;
+    const sy = (ih - srcSize) / 2;
+    ctx.drawImage(img, sx, sy, srcSize, srcSize, hx, hy, headSize, headSize);
+  } else {
+    // placeholder head
+    ctx.fillStyle = '#f2d1c9';
+    ctx.fillRect(hx, hy, headSize, headSize);
+  }
+  ctx.restore();
+
+  // small face outline
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.arc(hx + headSize/2, hy + headSize/2, headSize/2+1, 0, Math.PI*2);
+  ctx.stroke();
+}
+
+/* init: start music or give instructions */
+showMessage('Tippe ◀ ▶ ↑ oder verwende Tasten. Sammle alle Noten!');
+
+/* Prevent touch scroll on mobile while touching canvas */
+document.body.addEventListener('touchmove', function(e){ if (e.target === canvas || e.target.closest('.btn')) e.preventDefault(); }, {passive:false});
+
+</script>
+</body>
+</html>
